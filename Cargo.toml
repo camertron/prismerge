@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 clap = { version = "~4.5.20", features = ["derive"] }
 indicatif = "~0.17.8"
-rusqlite = "~0.32.1"
+rusqlite = { version = "~0.32.1", features = ["bundled"] }
 tap = "~1.0.1"
 topological-sort = "~0.2.2"
 tree-sitter = "~0.20.0"
