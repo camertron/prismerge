@@ -4,16 +4,32 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# Command Line Argument Parser for easy CLIs.
 clap = { version = "~4.5.20", features = ["derive"] }
+
+# Progress bar library.
 indicatif = "~0.17.8"
+
+# Use bundled SQLite to avoid annoying discrepancies between versions of
+# SQLite, such as arise when using the version that comes pre-installed
+# on GitHub Actions runners.
 rusqlite = { version = "~0.32.1", features = ["bundled"] }
+
+# Ruby's Object#tap for Rust, eg. [].tap { |a| a << "b" }
 tap = "~1.0.1"
+
+# For sorting things with dependencies, like database tables.
 topological-sort = "~0.2.2"
+
+# Parser for the Prisma schema format.
 tree-sitter = "~0.20.0"
 tree-sitter-prisma-io = { version = "~1.4.0" }
+
+# Unique ID generator.
 uuid = { version = "~1.11.0", features = ["v4"] }
 
 [build-dependencies]
+# Build tool for c-based projects. Used by rusqlite.
 cc="*"
 
 [[bin]]

@@ -1,3 +1,86 @@
+/*
+    PRISMERGE - a tool for merging SQLite databases together using their shared Prisma schema.
+
+    Cameron C. Dutro
+    November 2024
+
+    Preamble
+
+    Prismerge is a tool written specifically for merging SQLite databases together for an
+    internal tool at GitHub that allows engineers working on the Primer design system
+    (https://primer.style) to easily identify React and Rails component usages across
+    various repositories and package versions.
+
+    NOTE: Prismerge may or may not work for your use-case. Please read this entire comment
+    carefully to understand how it works and what it assumes about your schema and data
+    model.
+
+
+    Introduction
+
+    Prismerge is capable of merging n distinct SQLite databases into a single database,
+    where each database has the same schema defined in a Prisma schema file. Prisma is a
+    JavaScript ORM akin to ActiveRecord in Rails, Ecto in Phoenix, or Hibernate in Java.
+    The schema file enumerates the columns present in each table as well as the
+    relationships between tables. The information in the schema file is more accurate
+    than what could be gathered by dumping the database's native schema, and also easier
+    to parse. Prismerge copies data from each input database into a final merged database,
+    ensuring foreign key data integrity along the way.
+
+    The idea is fairly straightforward: each time a row is inserted into the database,
+    record its old primary key (eg. its "ID") and its new primary key in a separate mapping
+    table. When inserting rows that reference this table via a foreign key, translate the
+    old ID to the new ID before insertion. This way, all copied rows will correctly
+    reference their parent rows in the new database.
+
+
+    Assumptions
+
+    Prismerge assumes several major things about your schema and data model:
+
+    1. All tables have a primary key.
+
+    2. All primary keys are UUID strings. When inserting new rows, prismerge generates new
+       UUIDs and inserts them into both the merged table and the mapping table. Prismerge
+       is not designed to accommodate non-string, non-UUID primary keys.
+
+    3. Tables have unique indices to prevent duplicate rows. Prismerge detects the
+       presence of unique indices defined in the Prisma schema and uses them to prevent
+       inserting duplicate rows. For each row in each of the input databases, Prismerge
+       checks the merged database for a row that contains the same data as the current one.
+       If such a row exists, prismerge skips inserting a new row and instead only inserts
+       a mapping table row where the old ID is the ID of the original row and the new ID
+       is the ID of the already inserted row.
+
+    4. No cycles. Prismerge assumes no cycles in the graph of relationships between tables,
+       i.e. A depends on B which depends on A again.
+
+
+    Maintaining foreign key integrity
+
+    Connections between tables in relational databases can be thought of as a series of
+    parent-child relationships. Foreign keys in child tables point to rows in parent tables.
+    This means rows in parent tables must exist before child rows can reference them, and
+    rows in grandparent tables must exist before parent rows can reference _them_, and so on
+    and so forth all the way up the family tree.
+
+    To ensure data is inserted in the correct order, Prismerge uses the relationships
+    defined in the Prisma schema to populate tables from the top of the family tree to the
+    bottom. This ensures that parent rows exist before child rows need to reference them.
+    To achieve the correct ordering, prismerge uses a topological sorting algorithm.
+
+
+    Primary and secondary databases
+
+    It is much more efficient to insert data into the merged database without checking if
+    the row exists already. To maximize efficiency and on a per-table basis, prismerge
+    counts the rows for the table in each of the input databases. The database with the
+    most records in the given table is called the primary, and all the rest are secondaries.
+    Prismerge skips the existence check when copying data from the primary, which is much
+    faster. Unfortunately, existence checking must be performed for all the secondary
+    databases.
+*/
+
 use prismerge::prisma_parser::{self, Column, Model, Schema};
 use std::{fs, time::SystemTime};
 use rusqlite::{Connection, Result};
@@ -13,19 +96,46 @@ use clap::{ArgAction, Parser};
     about="Merge SQLite databases together using their shared Prisma schema."
 )]
 struct CLI {
-    #[arg(long, short, value_name="PATH", help="The path to the Prisma schema file.")]
+    #[arg(
+        long,
+        short,
+        value_name="PATH",
+        help="The path to the Prisma schema file."
+    )]
     schema_path: String,
 
-    #[arg(long, short, value_name="PATH", default_value="./merged.db", help="The path of the merged database file.")]
+    #[arg(
+        long,
+        short,
+        value_name="PATH",
+        default_value="./merged.db",
+        help="The path of the merged database file."
+    )]
     output_path: String,
 
-    #[arg(long, short, action=ArgAction::SetFalse, help="After merging is complete, don't drop the temporary tables prismerge creates to keep track of old -> new foreign key mappings.")]
+    #[arg(
+        long,
+        short,
+        action=ArgAction::SetFalse,
+        help="After merging is complete, don't drop the temporary tables prismerge creates to keep track of old -> new foreign key mappings."
+    )]
     keep_id_maps: bool,
 
-    #[arg(long, short, value_name="NUMBER", default_value="1000", help="The minimum number of rows to insert at a time.")]
+    #[arg(
+        long,
+        short,
+        value_name="NUMBER",
+        default_value="1000",
+        help="The minimum number of rows to insert at a time."
+    )]
     min_inserts: u64,
 
-    #[arg(value_name="INPUT PATHS", num_args=1.., required=true, help="Paths to the SQLite database files to merge.")]
+    #[arg(
+        value_name="INPUT PATHS",
+        num_args=1..,
+        required=true,
+        help="Paths to the SQLite database files to merge."
+    )]
     input_paths: Vec<String>,
 }
 
@@ -232,8 +342,6 @@ fn merge_model(model: &Model, schema: &Schema, connections: &Vec<Connection>, me
         table = model.name
     );
 
-    // println!("Select query: {}", select_query);
-
     let mut check_sql_template: Option<String> = None;
 
     if let Some(unique) = &model.unique {
@@ -366,7 +474,6 @@ fn merge_model(model: &Model, schema: &Schema, connections: &Vec<Connection>, me
                         continue;
                     }
 
-                    // Re-use old pk so we don't have to update the map table
                     let new_pk = if is_primary {
                         old_pk.clone()
                     } else {
