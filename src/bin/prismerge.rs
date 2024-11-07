@@ -121,7 +121,7 @@ struct CLI {
     #[arg(
         long,
         short,
-        action=ArgAction::SetFalse,
+        action=ArgAction::SetTrue,
         help="After merging is complete, don't drop the temporary tables prismerge creates to keep track of old -> new foreign key mappings."
     )]
     keep_id_maps: bool,
@@ -351,11 +351,11 @@ fn main() -> Result<(), String> {
     }
 
     // Clean up after ourselves by dropping all the map tables.
-    // if !options.keep_id_maps {
+    if !options.keep_id_maps {
         for current_model in order {
             current_model.map_table.drop_from(&merged);
         }
-    // }
+    }
 
     // Reclaim space from deleted tables, etc.
     vacuum(&merged);
@@ -620,12 +620,9 @@ fn merge_model(model: &Model, schema: &Schema, connections: &Vec<Connection>, me
                             let old_id: String = row.get(field_index).unwrap();
                             field_index += 1;
 
-                            // TODO: do we need the COALESCE anymore now that we
-                            // always insert rows into the ID map, even for the primary?
                             select_values.push(format!(
-                                "COALESCE({}_id_map.new_id, {})",
-                                related_column.ty.name,
-                                old_id
+                                "{}_id_map.new_id",
+                                related_column.ty.name
                             ));
 
                             select_columns.push(column.name.as_str());
