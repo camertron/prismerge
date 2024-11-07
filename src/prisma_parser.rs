@@ -1,3 +1,4 @@
+use rusqlite::Connection;
 use tree_sitter_prisma_io;
 use tree_sitter::{Node, Parser};
 use std::{collections::HashMap, hash::Hash};
@@ -48,7 +49,10 @@ impl Column {
     }
 
     pub fn is_regular(self: &Self, schema: &Schema) -> bool {
-        !self.primary_key && !self.ty.collection && !self.has_relation() && !schema.models.contains_key(&self.ty.name)
+        !self.primary_key &&
+            !self.ty.collection &&
+            !self.has_relation() &&
+            !schema.models.contains_key(&self.ty.name)
     }
 }
 
@@ -61,24 +65,39 @@ pub struct Unique {
 pub struct Model {
     pub name: String,
     pub columns: Vec<Column>,
-    pub unique: Option<Unique>
+    pub unique: Option<Unique>,
+    pub map_table: MapTable,
+    pub primary_key_index: Option<usize>
 }
 
 impl Model {
-    pub fn primary_key(self: &Self) -> Option<&Column> {
-        for column in self.columns.iter() {
+    pub fn new(name: String, columns: Vec<Column>, unique: Option<Unique>) -> Self {
+        let mut primary_key_index: Option<usize> = None;
+
+        for (idx, column) in columns.iter().enumerate() {
             if column.primary_key {
-                return Some(column);
+                primary_key_index = Some(idx)
             }
+        }
+
+        Model {
+            name: name.clone(),
+            columns,
+            unique,
+            map_table: MapTable::new(name),
+            primary_key_index: primary_key_index
+        }
+    }
+
+    pub fn primary_key(self: &Self) -> Option<&Column> {
+        if let Some(idx) = self.primary_key_index {
+            return Some(&self.columns[idx]);
         }
 
         None
     }
 
-    pub fn map_table_name(self: &Self) -> String {
-        format!("{}_id_map", self.name)
-    }
-
+    // Return the column with the given name.
     pub fn get_col(self: &Self, name: &str) -> Option<&Column> {
         for column in self.columns.iter() {
             if column.name == name {
@@ -87,6 +106,24 @@ impl Model {
         }
 
         None
+    }
+
+    // Check that all foreign keys point to existing records. Returns the count of
+    // rows that have bad/missing foreign keys.
+    pub fn verify_integrity(self: &Self, conn: &Connection) -> Result<(), usize> {
+        let mut result: Result<(), usize> = Ok(());
+
+        conn.query_row(format!("SELECT COUNT(*) FROM pragma_foreign_key_check('{}');", self.name).as_str(), (), |row| {
+            let count = row.get::<_, usize>(0).unwrap();
+
+            if count > 0 {
+                result = Err(count);
+            }
+
+            Ok(())
+        }).unwrap();
+
+        result
     }
 }
 
@@ -103,6 +140,57 @@ impl PartialEq for Model {
 }
 
 impl Eq for Model {
+}
+
+#[derive(Debug)]
+pub struct MapTable {
+    pub name: String
+}
+
+impl MapTable {
+    fn new(model_name: String) -> Self {
+        MapTable { name: format!("{}_id_map", model_name) }
+    }
+
+    pub fn create_into(self: &Self, connection: &Connection) {
+        let create_map_table_sql = format!(
+            r#"
+                CREATE TABLE {table} (
+                    old_id TEXT NOT NULL,
+                    new_id TEXT NOT NULL
+                )
+            "#,
+            table = self.name
+        );
+
+        connection.execute(create_map_table_sql.as_str(), ()).unwrap();
+    }
+
+    pub fn drop_from(self: &Self, connection: &Connection) {
+        connection.execute_batch(
+            format!(r#"
+                    DROP INDEX IF EXISTS "{table}_old_id";
+                    DROP INDEX IF EXISTS "{table}_new_id";
+                    DROP INDEX IF EXISTS "{table}_new_id_old_id";
+                    DROP TABLE IF EXISTS "{table}";
+                "#,
+                table = self.name
+            ).as_str()
+        ).unwrap();
+    }
+
+    pub fn create_indices(self: &Self, connection: &Connection) {
+        let query = format!(
+            r#"
+                CREATE INDEX "{table}_old_id" ON "{table}"("old_id");
+                CREATE INDEX "{table}_new_id" ON "{table}"("new_id");
+                CREATE INDEX "{table}_new_id_old_id" ON "{table}"("new_id", "old_id");
+            "#,
+            table = self.name
+        );
+
+        connection.execute_batch(query.as_str()).unwrap();
+    }
 }
 
 #[derive(Debug)]
@@ -261,7 +349,7 @@ fn handle_model_decl(cursor: &mut Cursor) -> Result<Model, String> {
         }
     }
 
-    Ok(Model { name, columns, unique })
+    Ok(Model::new(name, columns, unique))
 }
 
 fn handle_unique(cursor: &mut Cursor) -> Result<Unique, String> {

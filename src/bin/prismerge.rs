@@ -44,6 +44,10 @@
        UUIDs and inserts them into both the merged table and the mapping table. Prismerge
        is not designed to accommodate non-string, non-UUID primary keys.
 
+    3. Primary keys are strictly IDs and not data. For example, a table cannot use a git
+       SHA as a primary key because the merging process involves generating new primary
+       keys for inserted rows. This limitation could perhaps be relaxed in the future.
+
     3. Tables have unique indices to prevent duplicate rows. Prismerge detects the
        presence of unique indices defined in the Prisma schema and uses them to prevent
        inserting duplicate rows. For each row in each of the input databases, Prismerge
@@ -83,6 +87,7 @@
 
 use prismerge::prisma_parser::{self, Column, Model, Schema};
 use std::{fs, time::SystemTime};
+use std::io::{self, IsTerminal};
 use rusqlite::{Connection, Result};
 use uuid::Uuid;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -139,6 +144,26 @@ struct CLI {
     input_paths: Vec<String>,
 }
 
+/* The InsertManager is a convenient way to insert records in bulk. Every time
+ * a record is inserted, the manager adds it to an internal list. When the length
+ * of the list exceeds the given threshold, all the records are inserted at once,
+ * in bulk.
+ *
+ * There are two kinds of records managed by the InsertManager - regular reecords,
+ * and so-called "supporting" records. Supporting records are records that do not
+ * contribute to overall merge progress. For prismerge, supporting records are
+ * records inserted into ID mapping tables. Other records, i.e. records from
+ * input databases, are regular records.
+ *
+ * Insert regular records using the `insert()` method, `and insert_supporting()`
+ * to insert supporting records. The value of the `count` attribute will be
+ * incremented for regular records, but not for supporting records. Each insert
+ * method returns either 0 or this count value, indicating how many regular
+ * records were actually inserted.
+ *
+ * Call the `flush()` method to force the InsertManager to insert all pending
+ * records, regular and otherwise.
+ */
 struct InsertManager<'a> {
     connection: &'a Connection,
     threshold: u64,
@@ -180,19 +205,97 @@ impl<'a> InsertManager<'a> {
     }
 }
 
+enum ProgressType {
+    Bar(ProgressBar),
+    Console
+}
+
+/* A wrapper around the ProgressBar crate that falls back to regular 'ol console logging
+ * if STDIN isn't a terminal. Progress bars don't work super well in GitHub Actions and
+ * end up writing nothing, making it difficult to track merge progress.
+ */
+struct ProgressIndicator {
+    progress_type: ProgressType,
+    model_name: String,
+    total_rows: u64,
+    count: u64
+}
+
+impl ProgressIndicator {
+    fn new(model_name: &str, total_rows: u64) -> Self {
+        if io::stdin().is_terminal() {
+            let pb = ProgressBar::new(total_rows);
+
+            pb.set_style(
+                ProgressStyle::with_template(
+                    format!("{{spinner:.green}} {} [{{elapsed_precise}}] [{{wide_bar:.cyan/blue}}] {{pos}}/{{len}}", model_name).as_str()
+                )
+                .unwrap()
+                .progress_chars("#>-"));
+
+            ProgressIndicator {
+                progress_type: ProgressType::Bar(pb),
+                model_name: model_name.to_string(),
+                total_rows: total_rows,
+                count: 0
+            }
+        } else {
+            ProgressIndicator {
+                progress_type: ProgressType::Console,
+                model_name: model_name.to_string(),
+                total_rows: total_rows,
+                count: 0
+            }
+        }
+    }
+
+    fn inc(self: &mut Self, delta: u64) {
+        match &self.progress_type {
+            ProgressType::Bar(pb) => pb.inc(delta),
+            ProgressType::Console => {
+                self.count += delta;
+
+                if delta != 0 {
+                    println!("{}: Processed {}/{} records", self.model_name, self.count, self.total_rows);
+                }
+            }
+        }
+    }
+
+    fn finish(self: &mut Self) {
+        match &self.progress_type {
+            ProgressType::Bar(pb) => pb.finish(),
+            ProgressType::Console => {
+                self.count = self.total_rows;
+                println!("{}: Processed {}/{} records", self.model_name, self.count, self.total_rows);
+            }
+        }
+    }
+}
+
 fn main() -> Result<(), String> {
     let start_time = SystemTime::now();
     let options = CLI::parse();
 
+    // Load and parse the Prisma schema.
     let source_code_str = fs::read_to_string(options.schema_path).unwrap();
     let source_code = source_code_str.as_str();
     let schema = prisma_parser::parse(source_code).unwrap();
+
+    // Get a list of Model objects, sorted topologically so parent records are
+    // created before children.
     let order = schema.sorted();
 
-    // open connections to all databases
-    let connections: Vec<Connection> = options.input_paths[1..].iter().map(|path| Connection::open(path).unwrap()).collect();
+    // Open all input databases.
+    let connections: Vec<Connection> = options.input_paths[1..]
+        .iter()
+        .map(|path| Connection::open(path).unwrap())
+        .collect();
+
+    // Open output database.
     let merged = Connection::open(options.output_path).unwrap();
 
+    // Turn off a lot of important stuff so inserting is fast.
     merged.execute_batch(r#"
         PRAGMA synchronous = OFF;
         PRAGMA journal_mode = OFF;
@@ -201,7 +304,9 @@ fn main() -> Result<(), String> {
         PRAGMA foreign_keys = OFF;
     "#).unwrap();
 
-    // set up merged database by copying over the schema
+    // Set up the merged database by copying over the schema. Each row here is a
+    // CREATE TABLE or CREATE INDEX statement that we can execute directly on the
+    // merged database connection.
     let mut schema_query = connections[0].prepare("SELECT sql FROM sqlite_master;").unwrap();
     let mut schema_rows = schema_query.query(()).unwrap();
 
@@ -224,29 +329,38 @@ fn main() -> Result<(), String> {
         }
     }
 
+    // Merge each model.
     for current_model in &order {
         merge_model(current_model, &schema, &connections, &merged, options.min_inserts);
     }
 
+    // Turn important things back on to ensure integrity, etc.
     merged.execute_batch(r#"
         PRAGMA synchronous = ON;
         PRAGMA journal_mode = DELETE;
         PRAGMA foreign_keys = ON;
     "#).unwrap();
 
+    // Make sure there are no foreign key integrity problems. If there are,
+    // print out warnings so the user knows what's up.
     for current_model in &order {
-        match verify_integrity(current_model, &merged) {
+        match current_model.verify_integrity(&merged) {
             Err(count) => println!("Table {} has {} foreign key integrity problems", current_model.name, count),
             _ => ()
         }
     }
 
-    for current_model in order {
-        drop_map_table(current_model, &merged);
-    }
+    // Clean up after ourselves by dropping all the map tables.
+    // if !options.keep_id_maps {
+        for current_model in order {
+            current_model.map_table.drop_from(&merged);
+        }
+    // }
 
+    // Reclaim space from deleted tables, etc.
     vacuum(&merged);
 
+    // Report how long the whole merge process took.
     match start_time.elapsed() {
         Ok(elapsed) => {
             let total_secs = elapsed.as_secs();
@@ -267,58 +381,24 @@ fn main() -> Result<(), String> {
     Ok(())
 }
 
+// Runs the SQLite VACUUM command which reclaims space from deleted tables, indices, etc.
 fn vacuum(conn: &Connection) {
     conn.execute("VACUUM;", ()).unwrap();
 }
 
-fn drop_map_table(model: &Model, conn: &Connection) {
-    conn.execute_batch(
-        format!(r#"
-                DROP INDEX IF EXISTS "{map_table_name}_old_id";
-                DROP INDEX IF EXISTS "{map_table_name}_new_id";
-                DROP INDEX IF EXISTS "{map_table_name}_new_id_old_id";
-                DROP TABLE IF EXISTS "{map_table_name}";
-            "#,
-            map_table_name = model.map_table_name()
-        ).as_str()
-    ).unwrap();
-}
-
-fn verify_integrity(model: &Model, conn: &Connection) -> Result<(), usize> {
-    let mut result: Result<(), usize> = Ok(());
-
-    conn.query_row(format!("SELECT COUNT(*) FROM pragma_foreign_key_check('{}');", model.name).as_str(), (), |row| {
-        let count = row.get::<_, usize>(0).unwrap();
-
-        if count > 0 {
-            result = Err(count);
-        }
-
-        Ok(())
-    }).unwrap();
-
-    result
-}
-
+// This is where most of the magic happens. This function merges the records for the
+// given Model, copying records from the databases in `connections` into the database
+// in `merged`. The min_inserts argument specifies how many INSERTs to batch up before
+// inserting in bulk.
 fn merge_model(model: &Model, schema: &Schema, connections: &Vec<Connection>, merged: &Connection, min_inserts: u64) {
+    model.map_table.create_into(&merged);
+
     let mut inserter = InsertManager::new(merged, min_inserts);
-
-    let map_table_name = model.map_table_name();
-    let create_map_table = format!(
-        r#"
-            CREATE TABLE {table} (
-                old_id TEXT NOT NULL,
-                new_id TEXT NOT NULL
-            )
-        "#,
-        table = map_table_name
-    );
-
-    merged.execute(create_map_table.as_str(), ()).unwrap();
-
     let primary_key = model.primary_key().unwrap();
     let mut cols_to_copy: Vec<&Column> = vec![];
 
+    // Enumerate columns that will be copied wholesale, i.e. without any translation.
+    // In other words, all columns that aren't foreign keys.
     for column in model.columns.iter() {
         if column.is_regular(schema) {
             cols_to_copy.push(column);
@@ -331,6 +411,15 @@ fn merge_model(model: &Model, schema: &Schema, connections: &Vec<Connection>, me
         table = model.name
     );
 
+    // This is the query that will be used to iterate over all the rows in each of the
+    // input databases. We select two versions of the primary key, one quoted and one
+    // unquoted. It's important to select both because they are used in different contexts
+    // during the merge process.
+    //
+    // We also select quoted versions of all the other columns as well so they can be
+    // directly interpolated into INSERT statements without having to know what data type
+    // they are. It would be quite tedious to quote things or not depending on the type, so
+    // we let SQLite do the work for us.
     let select_query = format!(
         "SELECT \"{primary_key}\" AS unquoted_pk, quote(\"{primary_key}\") AS \"{primary_key}\", {quoted_columns} FROM \"{table}\" WHERE 1;",
         quoted_columns = cols_to_copy
@@ -344,6 +433,13 @@ fn merge_model(model: &Model, schema: &Schema, connections: &Vec<Connection>, me
 
     let mut check_sql_template: Option<String> = None;
 
+    // If the model has a unique index, we want to use it to query for existing records.
+    // We enumerate all of its columns here and build up a SELECT query. This query not
+    // only has to check existing "regular" columns (i.e. columns that are not foreign
+    // keys), but also foreign keys that will have been translated into new keys via one
+    // of the mapping tables. The resulting query includes a a JOIN clause for each of the
+    // foreign keys, as well as a WHERE clause containing normal comparisons for the
+    // regular columns and comparisons to the mapped old ID for all foreign keys.
     if let Some(unique) = &model.unique {
         let mut check_wheres: Vec<String> = vec![];
         let mut check_joins: Vec<String> = vec![];
@@ -351,6 +447,11 @@ fn merge_model(model: &Model, schema: &Schema, connections: &Vec<Connection>, me
         for (idx, name) in unique.column_names.iter().enumerate() {
             let col = model.get_col(name).unwrap();
 
+            // Check if the current column holds a foreign key by attempting to find the
+            // @relation associated with it. The Column struct returned by the
+            // `get_related_column()` method will return the column with the @relation
+            // annotation, which isn't an actual database column. That column's type points
+            // at the associated table, which allows us to construct the right JOIN clause.
             if let Some(related_column) = col.get_related_column(&model) {
                 check_joins.push(
                     format!(
@@ -369,6 +470,7 @@ fn merge_model(model: &Model, schema: &Schema, connections: &Vec<Connection>, me
                     )
                 );
             } else {
+                // Regular columns only need to have their values compared.
                 check_wheres.push(
                     format!(
                         "{col} = ?{idx}",
@@ -395,6 +497,10 @@ fn merge_model(model: &Model, schema: &Schema, connections: &Vec<Connection>, me
     }
 
     let mut total_rows: u64 = 0;
+
+    // As described earlier, the "primary" connection is the one that contains the
+    // largest number of rows for the given model. Every other connection is called
+    // a "secondary."
     let mut primary = &connections[0];
     let mut primary_count: u64 = 0;
 
@@ -410,45 +516,59 @@ fn merge_model(model: &Model, schema: &Schema, connections: &Vec<Connection>, me
         }
     }
 
+    // Insert the primary connection first so it's processed first. Copying from the
+    // primary connection first enables us to skip checking for existing records for
+    // the connection with the largest number of rows, which can significantly increase
+    // performance.
     let mut sorted_connections: Vec<&Connection> = vec![primary];
 
+    // Append all secondary connections.
     for conn in connections {
         if !core::ptr::eq(conn, primary) {
             sorted_connections.push(conn);
         }
     }
 
-    let pb = ProgressBar::new(total_rows);
+    let mut progress = ProgressIndicator::new(model.name.as_str(), total_rows);
 
-    pb.set_style(
-        ProgressStyle::with_template(
-            format!("{{spinner:.green}} {} [{{elapsed_precise}}] [{{wide_bar:.cyan/blue}}] {{pos}}/{{len}}", model.name).as_str()
-        )
-        .unwrap()
-        .progress_chars("#>-"));
-
+    // Iterate over each connection and copy all rows to the merged database.
     for conn in sorted_connections {
         let is_primary = core::ptr::eq(conn, primary);
         let is_secondary = !is_primary;
+
+        // Execute a query for iterating over all existing rows in the current input database.
         let mut stmt = conn.prepare(select_query.as_str()).unwrap();
         let mut rows = stmt.query(()).unwrap();
 
         loop {
             match rows.next() {
+                // Successfully fetched the next row
                 Ok(Some(row)) => {
                     let old_pk: String = row.get(0).unwrap();
                     let mut existing_pk: Option<String> = None;
 
+                    // If we're copying rows from a secondary database, check
+                    // if the current row already exists using the existing
+                    // unique index, if any.
                     if is_secondary {
                         if let Some(check_sql_orig) = &check_sql_template {
                             let mut check_sql = check_sql_orig.clone();
 
+                            // Rather than use rusqlite's mechanism for binding
+                            // values to a query string, we perform a dumb string
+                            // replacement here. Rusqlite expects placeholders of
+                            // the form ?<n>, where <n> is an unsigned integer.
+                            // Since all the columns we're copying have already
+                            // been quoted by SQLite, we want to avoid any extra
+                            // escaping or munging that rusqlite might do, so we
+                            // simply swap in the quoted value and call it a day.
                             for (idx, col) in model.unique.as_ref().unwrap().column_names.iter().enumerate() {
                                 let value = row.get::<_, String>(col.as_str()).unwrap();
                                 check_sql = check_sql.replace(&format!("?{}", idx + 1), &value);
                             }
 
                             match merged.query_row(check_sql.as_str(), (), |row| {
+                                // Found a result, so record the existing primary key for use later.
                                 existing_pk = Some(row.get::<_, String>(0).unwrap());
                                 Ok(())
                             }) {
@@ -458,28 +578,38 @@ fn merge_model(model: &Model, schema: &Schema, connections: &Vec<Connection>, me
                         }
                     }
 
+                    // An existing row was found, so only insert a map table entry.
                     if let Some(existing_id) = existing_pk {
                         let id_map_insert = format!(
                             "INSERT INTO \"{table}\" (old_id, new_id) VALUES ('{old_pk}', {existing_id})",
-                            table = map_table_name,
+                            table = model.map_table.name,
                             old_pk = old_pk,
                             existing_id = existing_id
                         );
 
-                        // Even though this is an INSERT into the ID map table, it represents an actual row.
-                        // We're skipping because it already exists, so we call insert() instead of insert_supporting()
+                        // Even though this is an INSERT into the ID map table, it
+                        // represents an actual row. We're skipping because it already
+                        // exists, so we call insert() instead of insert_supporting()
                         // to count it towards merge progress.
-                        pb.inc(inserter.insert(id_map_insert));
+                        progress.inc(inserter.insert(id_map_insert));
 
                         continue;
                     }
 
+                    // In the case of the primary, we can use the old primary key. In
+                    // the case of a secondary, we mint a new primary key (mostly to
+                    // avoid confusion when debugging lol).
                     let new_pk = if is_primary {
                         old_pk.clone()
                     } else {
                         Uuid::new_v4().to_string()
                     };
 
+                    // Just as we did with the check_sql_template above, the INSERT
+                    // statement must not only copy over values from the original input
+                    // row, but also translate foreign keys via mapping tables. To
+                    // achieve this, a JOIN statement is included in the INSERT statement
+                    // for each foreign key.
                     let mut select_values: Vec<String> = vec![format!("'{}'", new_pk)];
                     let mut select_columns: Vec<&str> = vec![primary_key.name.as_str()];
                     let mut join_statements: Vec<String> = vec![];
@@ -489,6 +619,9 @@ fn merge_model(model: &Model, schema: &Schema, connections: &Vec<Connection>, me
                         if let Some(related_column) = column.get_related_column(&model) {
                             let old_id: String = row.get(field_index).unwrap();
                             field_index += 1;
+
+                            // TODO: do we need the COALESCE anymore now that we
+                            // always insert rows into the ID map, even for the primary?
                             select_values.push(format!(
                                 "COALESCE({}_id_map.new_id, {})",
                                 related_column.ty.name,
@@ -511,6 +644,7 @@ fn merge_model(model: &Model, schema: &Schema, connections: &Vec<Connection>, me
                         }
                     }
 
+                    // Construct the actual INSERT statement.
                     let insert_sql = format!(
                         r#"
                             INSERT INTO "{table}" ({column_names})
@@ -525,37 +659,37 @@ fn merge_model(model: &Model, schema: &Schema, connections: &Vec<Connection>, me
                         join_statements = join_statements.join("\n")
                     );
 
-                    pb.inc(inserter.insert(insert_sql));
+                    progress.inc(inserter.insert(insert_sql));
 
+                    // Construct the INSERT statement for the map table.
                     let id_map_insert = format!(
                         "INSERT INTO \"{table}\" (old_id, new_id) VALUES ('{old_id}', '{new_id}')",
-                        table = map_table_name,
+                        table = model.map_table.name,
                         old_id = old_pk,
                         new_id = new_pk
                     );
 
-                    pb.inc(inserter.insert_supporting(id_map_insert));
+                    progress.inc(inserter.insert_supporting(id_map_insert));
                 }
 
+                // Occurs when there are no more rows in the result set.
                 Ok(None) => break,
+
+                // Some SQLite error occurred.
                 Err(_) => continue
             }
         }
 
-        pb.inc(inserter.flush());
+        // Insert any lingering records.
+        progress.inc(inserter.flush());
     }
 
-    pb.inc(inserter.flush());
+    progress.inc(inserter.flush());
 
-    let map_table_indices = [
-        format!("CREATE INDEX \"{table}_id_map_old_id\" ON \"{table}\"(\"old_id\");", table = model.name),
-        format!("CREATE INDEX \"{table}_id_map_new_id\" ON \"{table}\"(\"new_id\");", table = model.name),
-        format!("CREATE INDEX \"{table}_id_map_new_id_old_id\" ON \"{table}\"(\"new_id\", \"old_id\");", table = model.name)
-    ];
+    // Create several indices on the mapping table. We do this after we're entirely
+    // finished inserting because it's much faster to do it at the end rather than
+    // refresh the index on each individual INSERT.
+    model.map_table.create_indices(&merged);
 
-    for map_table_index in map_table_indices {
-        merged.execute(&map_table_index, ()).unwrap();
-    }
-
-    pb.finish();
+    progress.finish();
 }
