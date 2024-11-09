@@ -85,7 +85,8 @@
     databases.
 */
 
-use prismerge::prisma_parser::{self, Column, Model, Schema};
+use prismerge::data::{Column, Model, Schema};
+use prismerge::prisma_parser;
 use std::{fs, time::SystemTime};
 use std::io::{self, IsTerminal};
 use rusqlite::{Connection, Result};
