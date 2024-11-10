@@ -293,6 +293,7 @@ dependencies = [
  "cc",
  "clap",
  "indicatif",
+ "lazy_static",
  "rusqlite",
  "tap",
  "topological-sort",

@@ -86,12 +86,13 @@
 */
 
 use prismerge::data::{Column, Model, Schema};
+use prismerge::insert_manager::InsertManager;
 use prismerge::prisma_parser;
+use prismerge::progress::ProgressIndicator;
+use prismerge::utils::format_duration;
 use std::{fs, time::SystemTime};
-use std::io::{self, IsTerminal};
 use rusqlite::{Connection, Result};
 use uuid::Uuid;
-use indicatif::{ProgressBar, ProgressStyle};
 use clap::{ArgAction, Parser};
 
 #[derive(Parser, Debug)]
@@ -145,135 +146,6 @@ struct CLI {
     input_paths: Vec<String>,
 }
 
-/* The InsertManager is a convenient way to insert records in bulk. Every time
- * a record is inserted, the manager adds it to an internal list. When the length
- * of the list exceeds the given threshold, all the records are inserted at once,
- * in bulk.
- *
- * There are two kinds of records managed by the InsertManager - regular reecords,
- * and so-called "supporting" records. Supporting records are records that do not
- * contribute to overall merge progress. For prismerge, supporting records are
- * records inserted into ID mapping tables. Other records, i.e. records from
- * input databases, are regular records.
- *
- * Insert regular records using the `insert()` method, `and insert_supporting()`
- * to insert supporting records. The value of the `count` attribute will be
- * incremented for regular records, but not for supporting records. Each insert
- * method returns either 0 or this count value, indicating how many regular
- * records were actually inserted.
- *
- * Call the `flush()` method to force the InsertManager to insert all pending
- * records, regular and otherwise.
- */
-struct InsertManager<'a> {
-    connection: &'a Connection,
-    threshold: u64,
-    statements: Vec<String>,
-    count: usize
-}
-
-impl<'a> InsertManager<'a> {
-    fn new(connection: &'a Connection, threshold: u64) -> Self {
-        InsertManager { connection, threshold, statements: vec![], count: 0 }
-    }
-
-    fn insert(self: &mut Self, statement: String) -> u64 {
-        self.statements.push(statement);
-        self.count += 1;
-        self.maybe_flush()
-    }
-
-    fn insert_supporting(self: &mut Self, statement: String) -> u64 {
-        self.statements.push(statement);
-        self.maybe_flush()
-    }
-
-    fn maybe_flush(self: &mut Self) -> u64 {
-        if self.statements.len() as u64 >= self.threshold {
-            return self.flush();
-        }
-
-        0
-    }
-
-    fn flush(self: &mut Self) -> u64 {
-        let batch = format!("BEGIN TRANSACTION; {}; COMMIT;", self.statements.join("; "));
-        self.connection.execute_batch(batch.as_str()).unwrap();
-        self.statements.clear();
-        let count = self.count as u64;
-        self.count = 0;
-        count
-    }
-}
-
-enum ProgressType {
-    Bar(ProgressBar),
-    Console
-}
-
-/* A wrapper around the ProgressBar crate that falls back to regular 'ol console logging
- * if STDIN isn't a terminal. Progress bars don't work super well in GitHub Actions and
- * end up writing nothing, making it difficult to track merge progress.
- */
-struct ProgressIndicator {
-    progress_type: ProgressType,
-    model_name: String,
-    total_rows: u64,
-    count: u64
-}
-
-impl ProgressIndicator {
-    fn new(model_name: &str, total_rows: u64) -> Self {
-        if io::stdin().is_terminal() {
-            let pb = ProgressBar::new(total_rows);
-
-            pb.set_style(
-                ProgressStyle::with_template(
-                    format!("{{spinner:.green}} {} [{{elapsed_precise}}] [{{wide_bar:.cyan/blue}}] {{pos}}/{{len}}", model_name).as_str()
-                )
-                .unwrap()
-                .progress_chars("#>-"));
-
-            ProgressIndicator {
-                progress_type: ProgressType::Bar(pb),
-                model_name: model_name.to_string(),
-                total_rows: total_rows,
-                count: 0
-            }
-        } else {
-            ProgressIndicator {
-                progress_type: ProgressType::Console,
-                model_name: model_name.to_string(),
-                total_rows: total_rows,
-                count: 0
-            }
-        }
-    }
-
-    fn inc(self: &mut Self, delta: u64) {
-        match &self.progress_type {
-            ProgressType::Bar(pb) => pb.inc(delta),
-            ProgressType::Console => {
-                self.count += delta;
-
-                if delta != 0 {
-                    println!("{}: Processed {}/{} records", self.model_name, self.count, self.total_rows);
-                }
-            }
-        }
-    }
-
-    fn finish(self: &mut Self) {
-        match &self.progress_type {
-            ProgressType::Bar(pb) => pb.finish(),
-            ProgressType::Console => {
-                self.count = self.total_rows;
-                println!("{}: Processed {}/{} records", self.model_name, self.count, self.total_rows);
-            }
-        }
-    }
-}
-
 fn main() -> Result<(), String> {
     let start_time = SystemTime::now();
     let options = CLI::parse();
@@ -283,10 +155,6 @@ fn main() -> Result<(), String> {
     let source_code = source_code_str.as_str();
     let schema = prisma_parser::parse(source_code).unwrap();
 
-    // Get a list of Model objects, sorted topologically so parent records are
-    // created before children.
-    let order = schema.sorted();
-
     // Open all input databases.
     let connections: Vec<Connection> = options.input_paths[1..]
         .iter()
@@ -294,7 +162,45 @@ fn main() -> Result<(), String> {
         .collect();
 
     // Open output database.
-    let merged = Connection::open(options.output_path).unwrap();
+    let merged = Connection::open(options.output_path.clone()).unwrap();
+
+    prismerge(&schema, &connections, &merged, options.min_inserts, true);
+
+    // Make sure there are no foreign key integrity problems. If there are,
+    // print out warnings so the user knows what's up.
+    for (_, current_model) in &schema.models {
+        match current_model.verify_integrity(&merged) {
+            Err(count) => println!("Table {} has {} foreign key integrity problems", current_model.name, count),
+            _ => ()
+        }
+    }
+
+    // Clean up after ourselves by dropping all the map tables.
+    if !options.keep_id_maps {
+        for (_, current_model) in &schema.models {
+            current_model.map_table.drop_from(&merged);
+        }
+    }
+
+    // Reclaim space from deleted tables, etc.
+    vacuum(&merged);
+
+    // Report how long the whole merge process took.
+    match start_time.elapsed() {
+        Ok(elapsed) => {
+            println!("Finished in {}", format_duration(&elapsed));
+        }
+
+        Err(_) => {}
+    }
+
+    Ok(())
+}
+
+fn prismerge(schema: &Schema, connections: &Vec<Connection>, merged: &Connection, min_inserts: u64, show_progress: bool)  {
+    // Get a list of Model objects, sorted topologically so parent records are
+    // created before children.
+    let order = schema.sorted();
 
     // Turn off a lot of important stuff so inserting is fast.
     merged.execute_batch(r#"
@@ -332,7 +238,7 @@ fn main() -> Result<(), String> {
 
     // Merge each model.
     for current_model in &order {
-        merge_model(current_model, &schema, &connections, &merged, options.min_inserts);
+        merge_model(current_model, &schema, &connections, &merged, min_inserts, show_progress);
     }
 
     // Turn important things back on to ensure integrity, etc.
@@ -341,45 +247,6 @@ fn main() -> Result<(), String> {
         PRAGMA journal_mode = DELETE;
         PRAGMA foreign_keys = ON;
     "#).unwrap();
-
-    // Make sure there are no foreign key integrity problems. If there are,
-    // print out warnings so the user knows what's up.
-    for current_model in &order {
-        match current_model.verify_integrity(&merged) {
-            Err(count) => println!("Table {} has {} foreign key integrity problems", current_model.name, count),
-            _ => ()
-        }
-    }
-
-    // Clean up after ourselves by dropping all the map tables.
-    if !options.keep_id_maps {
-        for current_model in order {
-            current_model.map_table.drop_from(&merged);
-        }
-    }
-
-    // Reclaim space from deleted tables, etc.
-    vacuum(&merged);
-
-    // Report how long the whole merge process took.
-    match start_time.elapsed() {
-        Ok(elapsed) => {
-            let total_secs = elapsed.as_secs();
-            let secs = total_secs % 60;
-            let mins = total_secs / 60;
-            let hrs = total_secs / 60 / 60;
-
-            if hrs > 0 {
-                println!("Finished in {}h{:02}m{:02}s", hrs, mins, secs);
-            } else {
-                println!("Finished in {}m{:02}s", mins, secs);
-            }
-        }
-
-        Err(_) => {}
-    }
-
-    Ok(())
 }
 
 // Runs the SQLite VACUUM command which reclaims space from deleted tables, indices, etc.
@@ -391,7 +258,7 @@ fn vacuum(conn: &Connection) {
 // given Model, copying records from the databases in `connections` into the database
 // in `merged`. The min_inserts argument specifies how many INSERTs to batch up before
 // inserting in bulk.
-fn merge_model(model: &Model, schema: &Schema, connections: &Vec<Connection>, merged: &Connection, min_inserts: u64) {
+fn merge_model(model: &Model, schema: &Schema, connections: &Vec<Connection>, merged: &Connection, min_inserts: u64, show_progress: bool) {
     model.map_table.create_into(&merged);
 
     let mut inserter = InsertManager::new(merged, min_inserts);
@@ -530,7 +397,11 @@ fn merge_model(model: &Model, schema: &Schema, connections: &Vec<Connection>, me
         }
     }
 
-    let mut progress = ProgressIndicator::new(model.name.as_str(), total_rows);
+    let mut progress = if show_progress {
+        ProgressIndicator::new(model.name.as_str(), total_rows)
+    } else {
+        ProgressIndicator::null()
+    };
 
     // Iterate over each connection and copy all rows to the merged database.
     for conn in sorted_connections {
@@ -690,4 +561,366 @@ fn merge_model(model: &Model, schema: &Schema, connections: &Vec<Connection>, me
     model.map_table.create_indices(&merged);
 
     progress.finish();
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use prismerge::data::{Column, ColumnType, Model, Relation, Schema, Unique};
+    use lazy_static::lazy_static;
+    use rusqlite::Connection;
+    use tap::prelude::*;
+    use uuid::Uuid;
+
+    lazy_static! {
+        static ref SCHEMA: Schema = Schema::new().tap_mut(|schema| {
+            schema.models.insert(
+                "Owner".to_string(), Model::new(
+                    "Owner".to_string(),
+                    vec![
+                        Column {
+                            name: "id".to_string(),
+                            ty: ColumnType {
+                                name: "String".to_string(),
+                                collection: false,
+                                nullable: false
+                            },
+                            relation: None,
+                            unique: false,
+                            primary_key: true
+                        },
+
+                        Column {
+                            name: "name".to_string(),
+                            ty: ColumnType {
+                                name: "String".to_string(),
+                                collection: false,
+                                nullable: false
+                            },
+                            relation: None,
+                            unique: false,
+                            primary_key: false
+                        }
+                    ],
+                    Some(
+                        Unique {
+                            column_names: vec!["name".to_string()]
+                        }
+                    )
+                )
+            );
+
+            schema.models.insert(
+                "TodoList".to_string(), Model::new(
+                    "TodoList".to_string(),
+                    vec![
+                        Column {
+                            name: "id".to_string(),
+                            ty: ColumnType {
+                                name: "String".to_string(),
+                                collection: false,
+                                nullable: false
+                            },
+                            relation: None,
+                            unique: false,
+                            primary_key: true
+                        },
+
+                        Column {
+                            name: "name".to_string(),
+                            ty: ColumnType {
+                                name: "String".to_string(),
+                                collection: false,
+                                nullable: false
+                            },
+                            relation: None,
+                            unique: false,
+                            primary_key: false
+                        },
+
+                        Column {
+                            name: "ownerId".to_string(),
+                            ty: ColumnType {
+                                name: "String".to_string(),
+                                collection: false,
+                                nullable: false,
+                            },
+                            relation: None,
+                            unique: false,
+                            primary_key: false
+                        },
+
+                        Column {
+                            name: "owner".to_string(),
+                            ty: ColumnType {
+                                name: "Owner".to_string(),
+                                collection: false,
+                                nullable: false
+                            },
+                            relation: Some(
+                                Relation {
+                                    fields: vec!["ownerId".to_string()],
+                                    references: vec!["id".to_string()]
+                                }
+                            ),
+                            unique: false,
+                            primary_key: false
+                        }
+                    ],
+                    Some(
+                        Unique {
+                            column_names: vec!["name".to_string(), "ownerId".to_string()]
+                        }
+                    )
+                )
+            );
+        });
+    }
+
+    fn apply_schema(conn: &Connection) {
+        Owner::setup(conn);
+        TodoList::setup(conn);
+    }
+
+    fn create_connection() -> Connection {
+        Connection::open_in_memory().unwrap()
+    }
+
+    fn create_connections() -> (Connection, Connection, Connection) {
+        let first = create_connection();
+        let second = create_connection();
+        let merged = create_connection();
+
+        apply_schema(&first);
+        apply_schema(&second);
+
+        (first, second, merged)
+    }
+
+    #[derive(Debug)]
+    struct Owner {
+        id: String,
+        name: String,
+    }
+
+    impl Owner {
+        fn setup(conn: &Connection) {
+            conn.execute_batch(
+                r#"
+                    CREATE TABLE IF NOT EXISTS "Owner" (
+                        "id"    TEXT NOT NULL PRIMARY KEY,
+                        "name"  TEXT NOT NULL
+                    );
+
+                    CREATE UNIQUE INDEX IF NOT EXISTS "Owner_name_key"
+                    ON "Owner"("name");
+                "#
+            ).unwrap();
+        }
+
+        fn create(conn: &Connection, name: &str) -> Owner {
+            let id = Uuid::new_v4().to_string();
+
+            conn.execute(
+                "INSERT INTO Owner(\"id\", \"name\") VALUES(?1, ?2)",
+                [id.as_str(), name]
+            ).unwrap();
+
+            Owner {
+                id,
+                name: name.to_string()
+            }
+        }
+
+        fn all_by_name(conn: &Connection) -> HashMap<String, Owner> {
+            let mut result: HashMap<String, Owner> = HashMap::new();
+            let mut stmt = conn.prepare("SELECT * FROM \"Owner\" WHERE 1").unwrap();
+            let mut rows = stmt.query([]).unwrap();
+
+            loop {
+                match rows.next() {
+                    Ok(Some(row)) => {
+                        let id: String = row.get("id").unwrap();
+                        let name: String = row.get("name").unwrap();
+                        result.insert(name.clone(), Owner { id, name });
+                    },
+
+                    Ok(None) => break,
+                    Err(_) => break,
+                }
+            }
+
+            result
+        }
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct TodoList {
+        id: String,
+        name: String,
+        owner_id: String
+    }
+
+    impl TodoList {
+        fn setup(conn: &Connection) {
+            conn.execute_batch(
+                r#"
+                    CREATE TABLE IF NOT EXISTS "TodoList" (
+                        "id"      TEXT NOT NULL PRIMARY KEY,
+                        "name"    TEXT NOT NULL,
+                        "ownerId" TEXT NOT NULL,
+                        CONSTRAINT "TodoList_ownerId_fkey"
+                            FOREIGN KEY ("ownerId")
+                            REFERENCES "Owner" ("id")
+                            ON DELETE RESTRICT
+                            ON UPDATE CASCADE
+                    );
+
+                    CREATE UNIQUE INDEX IF NOT EXISTS "TodoList_name_ownerId_key"
+                    ON "TodoList"("name", "ownerId");
+                "#
+            ).unwrap();
+        }
+
+        fn create(conn: &Connection, name: &str, owner_id: &str) -> TodoList {
+            let id = Uuid::new_v4().to_string();
+
+            conn.execute(
+                "INSERT INTO TodoList(\"id\", \"name\", \"ownerId\") VALUES(?1, ?2, ?3)",
+                [id.as_str(), name, owner_id]
+            ).unwrap();
+
+            TodoList {
+                id,
+                name: name.to_string(),
+                owner_id: owner_id.to_string()
+            }
+        }
+
+        fn all_by_name(conn: &Connection) -> HashMap<String, TodoList> {
+            let mut result: HashMap<String, TodoList> = HashMap::new();
+            let mut stmt = conn.prepare("SELECT * FROM \"TodoList\" WHERE 1").unwrap();
+            let mut rows = stmt.query([]).unwrap();
+
+            loop {
+                match rows.next() {
+                    Ok(Some(row)) => {
+                        let id: String = row.get("id").unwrap();
+                        let name: String = row.get("name").unwrap();
+                        let owner_id: String = row.get("ownerId").unwrap();
+                        result.insert(name.clone(), TodoList { id, name, owner_id });
+                    },
+
+                    Ok(None) => break,
+                    Err(_) => break,
+                }
+            }
+
+            result
+        }
+    }
+
+    #[test]
+    fn merges_tables_with_no_foreign_keys() {
+        let (first, second, merged) = create_connections();
+
+        let woody = Owner::create(&first, "Woody");
+        let jessie = Owner::create(&second, "Jessie");
+        let bo = Owner::create(&second, "Bo");
+
+        crate::prismerge(
+            &SCHEMA,
+            &vec![first, second],
+            &merged,
+            1,
+            false
+        );
+
+        let records = Owner::all_by_name(&merged);
+        assert!(records.len() == 3);
+
+        // Jessie and Bo are part of the primary because there are more records in
+        // that db (2 vs 1). Because they're in the primary, they retain their old
+        // IDs.
+        assert!(records["Jessie"].name == "Jessie");
+        assert!(records["Jessie"].id == jessie.id);
+
+        assert!(records["Bo"].name == "Bo");
+        assert!(records["Bo"].id == bo.id);
+
+        // Woody is in the secondary DB and therefore gets a new ID.
+        assert!(records["Woody"].name == "Woody");
+        assert!(records["Woody"].id != woody.id);
+    }
+
+    #[test]
+    fn merges_tables_with_foreign_keys() {
+        let (first, second, merged) = create_connections();
+
+        let woody = Owner::create(&first, "Woody");
+        let jessie = Owner::create(&second, "Jessie");
+        let bo = Owner::create(&second, "Bo");
+
+        TodoList::create(&first, "Groceries", woody.id.as_str());
+        TodoList::create(&second, "Chores", jessie.id.as_str());
+        TodoList::create(&second, "Errands", bo.id.as_str());
+
+        crate::prismerge(
+            &SCHEMA,
+            &vec![first, second],
+            &merged,
+            1,
+            false
+        );
+
+        let owners = Owner::all_by_name(&merged);
+        let todo_lists = TodoList::all_by_name(&merged);
+
+        assert!(owners.len() == 3);
+        assert!(todo_lists.len() == 3);
+
+        let woodys_groceries = todo_lists.get("Groceries").unwrap();
+        assert!(woodys_groceries.name == "Groceries");
+        assert!(woodys_groceries.owner_id == owners.get("Woody").unwrap().id);
+
+        let jessies_chores = todo_lists.get("Chores").unwrap();
+        assert!(jessies_chores.name == "Chores");
+        assert!(jessies_chores.owner_id == owners.get("Jessie").unwrap().id);
+
+        let bos_errands = todo_lists.get("Errands").unwrap();
+        assert!(bos_errands.name == "Errands");
+        assert!(bos_errands.owner_id == owners.get("Bo").unwrap().id);
+    }
+
+    #[test]
+    fn merges_duplicate_records() {
+        let (first, second, merged) = create_connections();
+        let first_woody = Owner::create(&first, "Woody");
+        let second_woody = Owner::create(&second, "Woody");
+
+        TodoList::create(&first, "Chores", first_woody.id.as_str());
+        TodoList::create(&second, "Errands", second_woody.id.as_str());
+
+        crate::prismerge(
+            &SCHEMA,
+            &vec![first, second],
+            &merged,
+            1,
+            false
+        );
+
+        let owners = Owner::all_by_name(&merged);
+        let todo_lists = TodoList::all_by_name(&merged);
+
+        assert!(owners.len() == 1);
+        assert!(todo_lists.len() == 2);
+
+        let merged_woody = owners.get("Woody").unwrap();
+        assert!([&first_woody.id, &second_woody.id].contains(&&merged_woody.id));
+
+        for (_, todo_list) in todo_lists.iter() {
+            assert!(todo_list.owner_id == merged_woody.id);
+        }
+    }
 }

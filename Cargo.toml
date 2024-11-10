@@ -9,6 +9,7 @@ clap = { version = "~4.5.20", features = ["derive"] }
 
 # Progress bar library.
 indicatif = "~0.17.8"
+lazy_static = "1.5.0"
 
 # Use bundled SQLite to avoid annoying discrepancies between versions of
 # SQLite, such as arise when using the version that comes pre-installed
