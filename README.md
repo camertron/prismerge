@@ -1,3 +1,5 @@
+[![Tests](https://github.com/camertron/prismerge/actions/workflows/test.yml/badge.svg)](https://github.com/camertron/prismerge/actions/workflows/test.yml)
+
 ## prismerge
 
 Merge SQLite databases together using their shared Prisma schema.
