@@ -1,0 +1,31 @@
+{
+  "include": [
+    "src/**/*.ts",
+    "index.ts"
+  ],
+  "exclude": [
+    "node_modules"
+  ],
+  "compilerOptions": {
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "target": "es2022",
+    "allowJs": true,
+    "resolveJsonModule": true,
+    "moduleDetection": "force",
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "declaration": true,
+
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+
+    "incremental": true,
+    "moduleResolution": "node",
+    "module": "es2022",
+    "outDir": "dist",
+
+    "lib": ["es2022", "dom"],
+    "types": ["node"]
+  }
+}

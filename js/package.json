@@ -1,0 +1,46 @@
+{
+  "name": "prismerge",
+  "version": "1.0.0",
+  "description": "Merge SQLite databases together using their shared Prisma schema.",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "test": "jest",
+    "build": "npx tsc"
+  },
+  "bin": {
+    "prismerge": "dist/src/cli.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/camertron/prismerge.git"
+  },
+  "keywords": [
+    "sqlite",
+    "merge",
+    "prisma",
+    "database"
+  ],
+  "author": "Cameron C. Dutro",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/camertron/prismerge/issues"
+  },
+  "homepage": "https://github.com/camertron/prismerge#readme",
+  "dependencies": {
+    "@prisma/client": "^6.1.0",
+    "cli-progress": "^3.12.0",
+    "commander": "^13.0.0",
+    "prisma": "^6.1.0",
+    "sqlite": "^5.1.1",
+    "sqlite3": "^5.1.7",
+    "toposort": "^2.0.2",
+    "tsx": "^4.19.2"
+  },
+  "devDependencies": {
+    "@types/cli-progress": "^3.11.6",
+    "@types/node": "^22.10.5",
+    "@types/toposort": "^2.0.7",
+    "typescript": "^5.7.3"
+  }
+}

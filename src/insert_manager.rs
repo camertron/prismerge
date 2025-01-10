@@ -5,7 +5,7 @@ use rusqlite::Connection;
  * of the list exceeds the given threshold, all the records are inserted at once,
  * in bulk.
  *
- * There are two kinds of records managed by the InsertManager - regular reecords,
+ * There are two kinds of records managed by the InsertManager - regular records,
  * and so-called "supporting" records. Supporting records are records that do not
  * contribute to overall merge progress. For prismerge, supporting records are
  * records inserted into ID mapping tables. Other records, i.e. records from
