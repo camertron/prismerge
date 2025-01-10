@@ -1,7 +1,7 @@
-import type { Connection } from "./connection";
-import { Some, None, type Option } from "./option";
+import type { Connection } from "./connection.js";
+import { Some, None, type Option } from "./option.js";
+import { Err, Ok, type Result } from "./result.js";
 import * as toposort from 'toposort';
-import { Err, Ok, type Result } from "./result";
 
 export class Relation {
   constructor(

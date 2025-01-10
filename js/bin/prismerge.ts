@@ -1,4 +1,6 @@
-import { merge } from "./merge"
+#! /usr/bin/env node
+
+import { merge } from "prismerge"
 import { Command } from "commander"
 import fs from "fs";
 import readline from "readline";

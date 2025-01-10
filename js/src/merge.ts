@@ -87,13 +87,13 @@
 
 import sqlite3 from 'sqlite3'
 import { open } from 'sqlite';
-import { getSchema } from './prisma';
-import type { Column, Model, Schema } from './data';
-import { Connection } from './connection';
-import { InsertManager } from './insert_manager';
-import { type Option, None, Some } from './option';
+import { getSchema } from './prisma.js';
+import type { Column, Model, Schema } from './data.js';
+import { Connection } from './connection.js';
+import { InsertManager } from './insert_manager.js';
+import { type Option, None, Some } from './option.js';
 import * as crypto from "node:crypto";
-import { ProgressIndicator } from './progress';
+import { ProgressIndicator } from './progress.js';
 
 const DEFAULT_MIN_INSERTS = 1000;
 

@@ -1,6 +1,6 @@
 import { Statement, type Database } from 'sqlite';
-import { Err, Ok, type Result } from "./result";
-import { None, Some, type Option } from "./option";
+import { Err, Ok, type Result } from "./result.js";
+import { None, Some, type Option } from "./option.js";
 
 export class Connection {
   constructor(public db: Database) {}

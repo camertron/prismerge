@@ -1,7 +1,7 @@
 import { Prisma } from "@prisma/client";
-import { Column, ColumnType, Model, Relation, Schema, Unique } from "./data"
+import { Column, ColumnType, Model, Relation, Schema, Unique } from "./data.js"
 import type { DMMF } from "@prisma/client/runtime/library";
-import { Some, None, type Option } from "./option";
+import { Some, None, type Option } from "./option.js";
 
 export function getSchema(): Schema {
   const schema = new Schema();

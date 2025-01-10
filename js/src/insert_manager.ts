@@ -1,4 +1,4 @@
-import type { Connection } from "./connection";
+import type { Connection } from "./connection.js";
 
 /* The InsertManager is a convenient way to insert records in bulk. Every time
  * a record is inserted, the manager adds it to an internal list. When the length

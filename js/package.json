@@ -9,7 +9,7 @@
     "build": "npx tsc"
   },
   "bin": {
-    "prismerge": "dist/src/cli.js"
+    "prismerge": "dist/bin/prismerge.js"
   },
   "repository": {
     "type": "git",
@@ -41,6 +41,7 @@
     "@types/cli-progress": "^3.11.6",
     "@types/node": "^22.10.5",
     "@types/toposort": "^2.0.7",
-    "typescript": "^5.7.3"
+    "typescript": "^5.7.3",
+    "prismerge": "."
   }
 }
