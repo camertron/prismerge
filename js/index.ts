@@ -1,1 +1,1 @@
-export { merge } from "./src/merge.js";
+export { merge, prismerge } from "./src/merge.js";

@@ -7,8 +7,8 @@ on:
       - '*'
 
 jobs:
-  unit:
-    name: Unit tests
+  rust-unit:
+    name: Rust unit tests
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
@@ -17,3 +17,16 @@ jobs:
         toolchain: 1.81.0
     - name: Run tests
       run: cargo test
+  js-unit:
+    name: JavaScript unit tests
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Use Node.js 22.x
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22.x'
+        cache: 'npm'
+        cache-dependency-path: js/package-lock.json
+    - name: Run tests
+      run: cd js && npm run test

@@ -136,7 +136,7 @@ export async function merge(inputPaths: string[], outputPath: string, minInserts
   await merged.close();
 }
 
-async function prismerge(schema: Schema, connections: Connection[], merged: Connection, minInserts: number, showProgress: boolean): Promise<void> {
+export async function prismerge(schema: Schema, connections: Connection[], merged: Connection, minInserts: number, showProgress: boolean): Promise<void> {
   // Get a list of Model objects, sorted topologically so parent records are
   // created before children.
   let order = schema.sortedModels();

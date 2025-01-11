@@ -15,7 +15,6 @@
     "resolveJsonModule": true,
     "moduleDetection": "force",
     "isolatedModules": true,
-    "verbatimModuleSyntax": true,
     "declaration": true,
 
     "strict": true,
