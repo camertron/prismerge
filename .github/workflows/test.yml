@@ -28,5 +28,13 @@ jobs:
         node-version: '22.x'
         cache: 'npm'
         cache-dependency-path: js/package-lock.json
+    - name: Install dependencies
+      run: |
+        cd js && npm ci
     - name: Run tests
-      run: cd js && npm ci && npm run test
+      run: |
+        cd js && \
+        mkdir prisma && \
+        cp fixtures/schema.prisma ./prisma/ && \
+        npx prisma generate && \
+        npm run test
